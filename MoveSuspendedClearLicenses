@@ -1,0 +1,121 @@
+import subprocess
+import csv
+import logging
+import os
+
+# Set up logging
+logging.basicConfig(filename='<LOG_FILE_PATH>', level=logging.DEBUG, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Set GAM executable path and target OU
+gam_exe = "<GAM_EXECUTABLE_PATH>"
+target_ou = "/Suspended"
+user_list_csv = "<USER_LIST_CSV_PATH>"
+output_csv = "<OUTPUT_TEST_COMMANDS_CSV_PATH>"
+suspended_users_csv = "<SUSPENDED_USERS_CSV_PATH>"
+
+# Prompt user for "Test" or "Push"
+mode = input("Enter mode (Test/Push): ").strip().lower()
+logging.info(f"Script started in {mode.upper()} mode")
+
+# Function to execute a command or log it if in Test mode
+def handle_command(command, capture_output=False):
+    if mode == "push":
+        logging.debug(f"Executing: {command}")
+        print(f"Executing: {command}")  # Debugging: print the command being executed
+        try:
+            if capture_output:
+                result = subprocess.run(command, check=True, shell=True, capture_output=True, text=True)
+                logging.info(f"Command succeeded: {command}")
+                return result.stdout
+            else:
+                subprocess.run(command, check=True, shell=True)
+                logging.info(f"Command succeeded: {command}")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"An error occurred: {e}\nCommand: {command}")
+            print(f"An error occurred: {e}\nCommand: {command}")
+            if e.stderr:
+                logging.error(f"Error output: {e.stderr}")
+                print(f"Error output: {e.stderr}")
+    elif mode == "test":
+        with open(output_csv, "a", newline="") as outfile:
+            writer = csv.writer(outfile)
+            writer.writerow([command])
+        logging.debug(f"Test mode: Command saved to {output_csv}: {command}")
+        print(f"Test mode: Command saved to {output_csv}")
+
+# Step 1: Query Google to get a list of all users with their suspended status
+export_command = f'"{gam_exe}" print users fields primaryEmail,suspended'
+if output := handle_command(export_command, capture_output=True):
+    try:
+        with open(user_list_csv, "w", newline="") as outfile:
+            outfile.write(output)
+            logging.info(f"User data exported to {user_list_csv}")
+            print(f"User data exported to {user_list_csv}")
+    except Exception as e:
+        logging.error(f"Failed to write user data to {user_list_csv}: {e}")
+        print(f"Failed to write user data to {user_list_csv}: {e}")
+
+# Step 2: Process the CSV file to identify suspended users and prepare a list for batch processing
+suspended_users = []  # List to keep track of users to be moved
+try:
+    with open(user_list_csv, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            if row["suspended"].lower() == "true":  # Only process suspended users
+                user_email = row["primaryEmail"]
+                suspended_users.append(user_email)
+except Exception as e:
+    logging.error(f"Failed to read user list from {user_list_csv}: {e}")
+    print(f"Failed to read user list from {user_list_csv}: {e}")
+
+# Write suspended users to CSV file for batch processing
+if suspended_users:
+    try:
+        with open(suspended_users_csv, "w", newline="") as outfile:
+            writer = csv.writer(outfile)
+            writer.writerow(["primaryEmail"])  # Write header
+            for user in suspended_users:
+                writer.writerow([user])
+        logging.info(f"Suspended users list written to {suspended_users_csv}.")
+        print(f"\nSuspended users list written to {suspended_users_csv}.")
+    except Exception as e:
+        logging.error(f"Failed to write suspended users to {suspended_users_csv}: {e}")
+        print(f"Failed to write suspended users to {suspended_users_csv}: {e}")
+
+# Print summary of suspended users
+if suspended_users:
+    print("\nSuspended users to be moved:")
+    for user in suspended_users:
+        print(user)
+    logging.info(f"Suspended users to be moved: {', '.join(suspended_users)}")
+else:
+    print("\nNo suspended users found to be moved.")
+    logging.info("No suspended users found to be moved.")
+
+# In Push mode, ask the user whether to proceed or exit
+if mode == "push" and suspended_users:
+    print("\nThe following changes will be made:")
+    print(f"- Move {len(suspended_users)} suspended users to the '/Suspended' OU.")
+    print(
+        "- Remove Gemini Business and Google Workspace Enterprise Plus licenses from the suspended users."
+    )
+    logging.info(f"The following changes will be made: Move {len(suspended_users)} suspended users to the '/Suspended' OU, Remove licenses.")
+    proceed = input("\nDo you want to proceed with these changes? (yes/no): ").strip().lower()
+    if proceed != "yes":
+        logging.info("User chose not to proceed. Exiting without making any changes.")
+        print("Exiting without making any changes.")
+    else:
+        # Batch process suspended users using GAM
+        batch_command = f'"{gam_exe}" csv "{suspended_users_csv}" gam update user ~primaryEmail org "{target_ou}"'
+        handle_command(batch_command)
+
+        # Remove Gemini Business and Google Workspace Enterprise Plus licenses in batch
+        batch_license_removal_command = f'"{gam_exe}" csv "{suspended_users_csv}" gam user ~primaryEmail delete license "1010020020" "1010470003"'
+        handle_command(batch_license_removal_command)
+
+        logging.info("All suspended users have been moved to the '/Suspended' OU and licenses have been removed in batch.")
+        print("\nAll suspended users have been moved to the '/Suspended' OU and licenses have been removed in batch.")
+else:
+    logging.info("All suspended users have been processed in Test mode.")
+    print("\nAll suspended users have been processed in Test mode.")
