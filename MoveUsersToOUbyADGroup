@@ -1,0 +1,178 @@
+import subprocess
+import csv
+import os
+import logging
+from ldap3 import Server, Connection, ALL, SASL, KERBEROS
+
+# Configure logging
+log_directory = '/var/log/group_sync'
+os.makedirs(log_directory, exist_ok=True)
+log_path = os.path.join(log_directory, 'group_sync.log')
+logging.basicConfig(filename=log_path, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Check for required packages
+try:
+    import winkerberos
+    kerberos_available = True
+except ImportError:
+    kerberos_available = False
+    logging.error("winkerberos package is missing. Please install it using 'pip install winkerberos'.")
+    print("ERROR: winkerberos package is missing. Please install it using 'pip install winkerberos'.")
+
+# Set the paths
+gam_exe = "/path/to/gam"
+working_folder = "/path/to/working/folder"
+changes_csv = os.path.join(working_folder, "GroupToOU-Changes.csv")
+
+# Define groups and their corresponding OUs (sanitized)
+groups_to_ous = {
+    "group1@example.com": "/OU1",
+    "group2@example.com": "/OU2",
+    # Add more groups here
+}
+
+# Define AD groups and their corresponding Google groups (sanitized)
+ad_groups = {
+    "CN=Group1,OU=Security,DC=example,DC=com": "group1@example.com",
+    "CN=Group2,OU=Security,DC=example,DC=com": "group2@example.com",
+    # Add more AD groups here
+}
+
+# Prompt user for "Test" or "Push" mode
+mode = input("Enter mode (Test/Push): ").strip().lower()
+
+# Function to execute a command with error handling
+def run_command(command):
+    if mode == "push":
+        logging.info(f"Executing: {command}")
+        try:
+            subprocess.run(command, check=True, shell=True)
+        except subprocess.CalledProcessError as e:
+            logging.error(f"An error occurred while executing the command: {command}. Error: {e}")
+    elif mode == "test":
+        logging.info(f"Test mode: Command to be executed -> {command}")
+        print(f"Test mode: Command to be executed -> {command}")
+
+# Function to get AD group members with error handling
+def get_ad_group_members(group_dn):
+    if not kerberos_available:
+        logging.error(f"Cannot connect to LDAP for group {group_dn} because winkerberos is missing.")
+        return []
+
+    try:
+        return get_ad_group_members_from_ldap(group_dn)
+    except Exception as e:
+        logging.error(f"An error occurred while connecting to LDAP for group {group_dn}: {e}")
+        return []
+
+# Function to get AD group members from LDAP
+def get_ad_group_members_from_ldap(group_dn):
+    server = Server('ldap.example.com', get_info=ALL)
+    conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
+    if not conn.bind():
+        logging.error(f"Failed to bind to LDAP server for group {group_dn}.")
+        return []
+
+    logging.debug(f"Successfully connected to LDAP server for group {group_dn}. Searching for members...")
+
+    try:
+        # Use member attribute to get all members
+        conn.search(group_dn, '(objectClass=*)', search_scope='SUBTREE', attributes=['member'])
+    except Exception as search_error:
+        logging.error(f"LDAP search failed for group {group_dn} with error: {search_error}")
+        return []
+
+    if not conn.entries:
+        logging.warning(f"No members found for group {group_dn}.")
+        return []
+
+    members = []
+    for entry in conn.entries:
+        if 'member' in entry:
+            members.extend(entry.member)
+
+    if not members:
+        logging.warning(f"No members found for group {group_dn} using member attribute.")
+        return []
+
+    # Retrieve userPrincipalName for each member if it exists
+    user_principal_names = []
+    for member_dn in members:
+        try:
+            conn.search(member_dn, '(objectClass=person)', search_scope='BASE', attributes=['userPrincipalName'])
+            if conn.entries and hasattr(conn.entries[0], 'userPrincipalName'):
+                user_principal_names.append(conn.entries[0].userPrincipalName.value)
+        except Exception as member_error:
+            logging.error(f"Failed to retrieve userPrincipalName for {member_dn} with error: {member_error}")
+
+    return user_principal_names
+
+# Create working directory if it doesn't exist
+os.makedirs(working_folder, exist_ok=True)
+
+# Prepare the CSV file to record the changes (in Test mode)
+if mode == "test":
+    with open(changes_csv, mode='w', newline='') as changes_file:
+        changes_writer = csv.writer(changes_file)
+        changes_writer.writerow(["Group Email", "User Email", "Target OU"])
+
+# Process each AD group and corresponding Google group
+changes_to_make = []
+for group_dn, group_email in ad_groups.items():
+    # Get AD group members
+    ad_members = get_ad_group_members(group_dn)
+    if not ad_members:
+        logging.warning(f"No members found or failed to retrieve members for group {group_dn}. Skipping.")
+        continue
+
+    ad_members_set = set(ad_members)
+
+    # Define the CSV filename based on the group email
+    csv_filename = os.path.join(working_folder, f"group_members_{group_email.split('@')[0]}.csv")
+
+    # Export Google group members to CSV
+    export_command = f'"{gam_exe}" group "{group_email}" print users fields primaryEmail > "{csv_filename}"'
+    run_command(export_command)
+
+    # Read Google group members from CSV
+    if not os.path.exists(csv_filename) or os.path.getsize(csv_filename) == 0:
+        logging.warning(f"No Google group members found for group {group_email}. Skipping.")
+        continue
+
+    with open(csv_filename, mode='r', newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        google_members = [row['primaryEmail'].split('@')[0] for row in reader]
+
+    google_members_set = set(google_members)
+
+    # Compare AD and Google group members
+    if ad_members_set != google_members_set:
+        logging.info(f"Changes detected in {group_email}. Preparing to update Google group members.")
+        changes_to_make.extend(
+            (group_email, f"{member}@example.com", groups_to_ous[group_email])
+            for member in ad_members
+        )
+
+# Write and/or execute changes based on mode
+if mode == "test":
+    with open(changes_csv, mode='a', newline='') as changes_file:
+        changes_writer = csv.writer(changes_file)
+        changes_writer.writerows(changes_to_make)
+    print(f"Proposed changes have been written to {changes_csv}.")
+    logging.info(f"Proposed changes have been written to {changes_csv}.")
+elif mode == "push":
+    print("\nSummary of changes to be made:")
+    for group_email, user_email, target_ou in changes_to_make:
+        print(f"User: {user_email} -> Group: {group_email} -> OU: {target_ou}")
+    
+    proceed = input("\nDo you want to proceed with making these changes? (yes/no): ").strip().lower()
+    if proceed == "yes":
+        for group_email, user_email, target_ou in changes_to_make:
+            update_command = f'"{gam_exe}" update user "{user_email}" org "{target_ou}"'
+            run_command(update_command)
+    else:
+        print("Exiting without making any changes.")
+        logging.info("User chose not to proceed with the changes.")
+
+print("All groups have been processed.")
+logging.info("All groups have been processed.")
