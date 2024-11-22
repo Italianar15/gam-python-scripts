@@ -1,3 +1,5 @@
+#Set a default photo for users that don't already have one.
+
 import os
 import subprocess
 
